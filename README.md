@@ -40,7 +40,8 @@ chmod +x telnet_scanner.py
 ```bash
 python3 telnet_scanner.py
 ```
-[IMG_2498](https://github.com/user-attachments/assets/45273f71-78c5-4a53-b44c-d596daaafeae)
+
+![IMG_2498](https://github.com/user-attachments/assets/c9730ed7-60dc-44cb-9edf-0cda187ae9f3)
 
 
 ### Single Target Workflow!
