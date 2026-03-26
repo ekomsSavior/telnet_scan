@@ -12,6 +12,9 @@ A Python-based security assessment tool that detects and (where applicable) expl
 **This tool is for authorized security testing and educational purposes only.**  
 Unauthorized use against systems you do not own or have explicit permission to test is illegal. The authors assume no liability for misuse or damage caused by this tool. Use at your own risk.
 
+![image1(1)](https://github.com/user-attachments/assets/9530f820-3e9e-42c1-b442-8a4903e2b760)
+
+
 ## Features
 
 - **Single target scanning** – Enter IP addresses or domain names at runtime
@@ -40,14 +43,8 @@ python3 telnet_scanner.py
 
 The tool presents an interactive menu:
 
-```
-=== Telnet Vulnerability Scanner ===
-1. Scan a single target
-2. Scan targets from file (one IP/hostname per line)
-3. Exit
-```
+### Single Target Workflow![IMG_2498](https://github.com/user-attachments/assets/45273f71-78c5-4a53-b44c-d596daaafeae)
 
-### Single Target Workflow
 
 1. Choose option `1`
 2. Enter target (IP or domain, e.g., `192.168.1.100` or `example.com`)
@@ -219,3 +216,6 @@ If you discover vulnerable systems, apply these fixes:
 - Arrow keys and terminal resizing are not fully supported in the interactive shell
 - Some firewalls or network configurations may interfere with Telnet option negotiation
 - Windows users: The interactive shell requires a Unix-like terminal (WSL, Cygwin, or Linux/macOS)
+![image0(2)](https://github.com/user-attachments/assets/86cde5ca-545d-455c-8110-66515f192af3)
+
+  
