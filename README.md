@@ -46,6 +46,8 @@ The tool presents an interactive menu:
 ### Single Target Workflow![IMG_2498](https://github.com/user-attachments/assets/45273f71-78c5-4a53-b44c-d596daaafeae)
 
 
+
+
 1. Choose option `1`
 2. Enter target (IP or domain, e.g., `192.168.1.100` or `example.com`)
 3. Specify port (default is `23` if left empty)
