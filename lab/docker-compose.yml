@@ -1,0 +1,8 @@
+services:
+  vuln-telnetd:
+    build: .
+    container_name: vuln-telnetd-lab
+    ports:
+      - "127.0.0.1:2323:23"
+    privileged: true
+    restart: unless-stopped
